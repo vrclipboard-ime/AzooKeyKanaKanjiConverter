@@ -215,6 +215,14 @@ public struct ConvertRequestOptions: Sendable {
     }
 
     public struct ZenzaiMode: Sendable, Equatable {
+        /// Selects the llama.cpp device used for Zenzai inference at runtime.
+        public enum InferenceBackend: String, Sendable, Equatable, Hashable {
+            /// Disable accelerator devices and KQV offload.
+            case cpu
+            /// Use an accelerator backend compiled into llama.cpp.
+            case gpu
+        }
+
         public struct PersonalizationMode: Sendable, Equatable {
             public init(baseNgramLanguageModel: String, personalNgramLanguageModel: String, n: Int = 5, d: Double = 0.75, alpha: Float = 0.5) {
                 self.baseNgramLanguageModel = baseNgramLanguageModel
@@ -235,6 +243,7 @@ public struct ConvertRequestOptions: Sendable {
             weightURL: URL(fileURLWithPath: ""),
             inferenceLimit: 10,
             requestRichCandidates: false,
+            inferenceBackend: .cpu,
             versionDependentMode: .v3(.init())
         )
 
@@ -245,13 +254,21 @@ public struct ConvertRequestOptions: Sendable {
         ///    - requestRichCandidates: when this flag is true, the converter spends more time but generate richer N-Best candidates for candidate list view. Usually this option is not recommended for live conversion.
         ///    - personalizationMode: values for personalization.
         ///    - versionDependentMode: specify zenz model version and its configuration.
-        public static func on(weight: URL, inferenceLimit: Int = 10, requestRichCandidates: Bool = false, personalizationMode: PersonalizationMode?, versionDependentMode: ZenzaiVersionDependentMode = .v3(.init())) -> Self {
+        public static func on(
+            weight: URL,
+            inferenceLimit: Int = 10,
+            requestRichCandidates: Bool = false,
+            personalizationMode: PersonalizationMode?,
+            inferenceBackend: InferenceBackend = .gpu,
+            versionDependentMode: ZenzaiVersionDependentMode = .v3(.init())
+        ) -> Self {
             ZenzaiMode(
                 enabled: true,
                 weightURL: weight,
                 inferenceLimit: inferenceLimit,
                 requestRichCandidates: requestRichCandidates,
                 personalizationMode: personalizationMode,
+                inferenceBackend: inferenceBackend,
                 versionDependentMode: versionDependentMode
             )
         }
@@ -260,6 +277,7 @@ public struct ConvertRequestOptions: Sendable {
         var inferenceLimit: Int
         var requestRichCandidates: Bool
         var personalizationMode: PersonalizationMode?
+        public var inferenceBackend: InferenceBackend
         var versionDependentMode: ZenzaiVersionDependentMode
     }
 }

@@ -28,14 +28,29 @@ enum ZenzError: LocalizedError {
 ///
 /// `llama_backend_free()` は現在 MPI 用の後始末にしか使われないため、モデルや
 /// コンテキストより先に解放される可能性があるプロセス終了時の明示解放は行わない。
-private enum ZenzBackend {
-    private static let initialized: Void = {
-        llama_backend_init()
-    }()
-
-    static func initializeIfNeeded() {
-        _ = self.initialized
+package enum ZenzBackend {
+    package static func initializeIfNeeded(searchPath: String? = nil) {
+        self.lock.withLock {
+            guard !self.initialized else { return }
+            // Required when llama.cpp is built with GGML_BACKEND_DL. The loader
+            // runtime-scores CPU variants (generic, AVX, AVX2, AVX512, AMX) and
+            // registers optional accelerator backends such as Vulkan.
+            #if Zenzai || ZenzaiCPU
+            if let searchPath {
+                searchPath.withCString { path in
+                    ggml_backend_load_all_from_path(path)
+                }
+            } else {
+                ggml_backend_load_all()
+            }
+            #endif
+            llama_backend_init()
+            self.initialized = true
+        }
     }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var initialized = false
 }
 
 private final class ZenzTokenArrayBox {
@@ -270,23 +285,48 @@ final class ZenzaiMemoizationCache: @unchecked Sendable {
 /// KV cacheなどの可変状態は`ZenzContext`側に残し、モデルの重みとvocabularyだけを
 /// 共有することで、同じモデルを利用するConverterごとの再ロードを避ける。
 private final class SharedZenzModel {
-    init(path: String) throws {
+    init(
+        path: String,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws {
         ZenzBackend.initializeIfNeeded()
         var modelParams = llama_model_default_params()
         modelParams.use_mmap = true
         #if ZenzaiCPU
-        modelParams.n_gpu_layers = 0
-        modelParams.split_mode = LLAMA_SPLIT_MODE_NONE
-        guard let cpuDevice = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) else {
-            debug("Could not find CPU backend")
-            throw ZenzError.couldNotLoadModel(path: path)
-        }
-        // NULL終端のCPU-onlyデバイスリストを渡す。`n_gpu_layers = 0`だけでは
-        // llama.cppがMetalデバイスも列挙し、context生成時に初期化してしまう。
-        var devices = [cpuDevice, nil]
-        let loadedModel = devices.withUnsafeMutableBufferPointer { buffer in
-            modelParams.devices = buffer.baseAddress
-            return llama_model_load_from_file(path, modelParams)
+        let effectiveBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend = .cpu
+        #else
+        let effectiveBackend = inferenceBackend
+        #endif
+        #if Zenzai || ZenzaiCPU
+        let loadedModel: OpaquePointer?
+        if effectiveBackend == .cpu {
+            modelParams.n_gpu_layers = 0
+            modelParams.split_mode = LLAMA_SPLIT_MODE_NONE
+            guard let cpuDevice = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) else {
+                debug("Could not find CPU backend")
+                throw ZenzError.couldNotLoadModel(path: path)
+            }
+            // A NULL-terminated CPU-only device list is required. Setting
+            // n_gpu_layers to zero alone can still initialize GPU devices.
+            var devices = [cpuDevice, nil]
+            loadedModel = devices.withUnsafeMutableBufferPointer { buffer in
+                modelParams.devices = buffer.baseAddress
+                return llama_model_load_from_file(path, modelParams)
+            }
+        } else {
+            guard let gpuDevice = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU) else {
+                debug("Could not find GPU backend")
+                throw ZenzError.couldNotLoadModel(path: path)
+            }
+            // llama.cpp b4846 defaults n_gpu_layers to zero outside Metal.
+            // Explicitly offload every supported model layer for Vulkan/CUDA.
+            modelParams.n_gpu_layers = .max
+            modelParams.split_mode = LLAMA_SPLIT_MODE_NONE
+            var devices = [gpuDevice, nil]
+            loadedModel = devices.withUnsafeMutableBufferPointer { buffer in
+                modelParams.devices = buffer.baseAddress
+                return llama_model_load_from_file(path, modelParams)
+            }
         }
         #else
         let loadedModel = llama_model_load_from_file(path, modelParams)
@@ -323,13 +363,19 @@ private final class SharedZenzModelCache: @unchecked Sendable {
         self.cache.countLimit = 1
     }
 
-    func model(path: String) throws -> SharedZenzModel {
+    func model(
+        path: String,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws -> SharedZenzModel {
         try self.lock.withLock {
-            let key = path as NSString
+            let key = "\(inferenceBackend.rawValue):\(path)" as NSString
             if let cached = self.cache.object(forKey: key) {
                 return cached
             }
-            let model = try SharedZenzModel(path: path)
+            let model = try SharedZenzModel(
+                path: path,
+                inferenceBackend: inferenceBackend
+            )
             self.cache.setObject(model, forKey: key)
             return model
         }
@@ -345,14 +391,20 @@ final class ZenzContext {
     private var batch: llama_batch
     private var prevInputBySeq: [llama_seq_id: [llama_token]] = [:]
     private var prevPromptBySeq: [llama_seq_id: String] = [:]
+    private let inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
 
     private let n_len: Int32 = 512
     private let evalSeqId: llama_seq_id = 0
     private let inputPredictionSeqId: llama_seq_id = 1
 
-    private init(sharedModel: SharedZenzModel, context: OpaquePointer) {
+    private init(
+        sharedModel: SharedZenzModel,
+        context: OpaquePointer,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) {
         self.sharedModel = sharedModel
         self.context = context
+        self.inferenceBackend = inferenceBackend
         self.batch = llama_batch_init(512, 0, 1)
     }
 
@@ -430,12 +482,24 @@ final class ZenzContext {
     }
     #endif
 
-    static func createContext(path: String) throws -> ZenzContext {
-        let sharedModel = try SharedZenzModelCache.shared.model(path: path)
-        var params = ctx_params
+    static func createContext(
+        path: String,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws -> ZenzContext {
         #if ZenzaiCPU
-        // CPU 専用: KV / KQV 等の GPU オフロードを完全に無効化
-        params.offload_kqv = false
+        let effectiveBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend = .cpu
+        #else
+        let effectiveBackend = inferenceBackend
+        #endif
+        let sharedModel = try SharedZenzModelCache.shared.model(
+            path: path,
+            inferenceBackend: effectiveBackend
+        )
+        var params = ctx_params
+        #if Zenzai || ZenzaiCPU
+        if effectiveBackend == .cpu {
+            params.offload_kqv = false
+        }
         #endif
         let context = llama_init_from_model(sharedModel.model, params)
         guard let context else {
@@ -443,14 +507,20 @@ final class ZenzContext {
             throw ZenzError.couldNotLoadContext
         }
 
-        return ZenzContext(sharedModel: sharedModel, context: context)
+        return ZenzContext(
+            sharedModel: sharedModel,
+            context: context,
+            inferenceBackend: effectiveBackend
+        )
     }
 
     func resetContext() throws {
         llama_free(self.context)
         var params = Self.ctx_params
-        #if ZenzaiCPU
-        params.offload_kqv = false
+        #if Zenzai || ZenzaiCPU
+        if self.inferenceBackend == .cpu {
+            params.offload_kqv = false
+        }
         #endif
         let context = llama_init_from_model(self.sharedModel.model, params)
         guard let context else {

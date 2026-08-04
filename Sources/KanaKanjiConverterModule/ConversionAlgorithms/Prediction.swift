@@ -13,6 +13,7 @@ struct PredictiveInputCacheContext: Sendable, Equatable {
     var leftSideContext: String
     var inputStyle: InputStyle
     var weightURL: URL
+    var inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
     var versionDependentConfig: ConvertRequestOptions.ZenzaiVersionDependentMode
 }
 
