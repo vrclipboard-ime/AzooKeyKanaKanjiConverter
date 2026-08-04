@@ -14,13 +14,19 @@ private final class SharedZenzCache: @unchecked Sendable {
         self.cache.countLimit = 1
     }
 
-    func zenz(resourceURL: URL) throws -> Zenz {
+    func zenz(
+        resourceURL: URL,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws -> Zenz {
         try self.lock.withLock {
-            let key = resourceURL.absoluteString as NSString
+            let key = "\(inferenceBackend.rawValue):\(resourceURL.absoluteString)" as NSString
             if let cached = self.cache.object(forKey: key) {
                 return cached
             }
-            let zenz = try Zenz(resourceURL: resourceURL)
+            let zenz = try Zenz(
+                resourceURL: resourceURL,
+                inferenceBackend: inferenceBackend
+            )
             self.cache.setObject(zenz, forKey: key)
             return zenz
         }
@@ -32,26 +38,46 @@ private final class SharedZenzCache: @unchecked Sendable {
 
 package final class Zenz {
     package var resourceURL: URL
+    package let inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
     private var zenzContext: ZenzContext?
     private let inferenceLock = NSLock()
 
-    package static func shared(resourceURL: URL) throws -> Zenz {
-        try SharedZenzCache.shared.zenz(resourceURL: resourceURL)
+    package static func shared(
+        resourceURL: URL,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws -> Zenz {
+        try SharedZenzCache.shared.zenz(
+            resourceURL: resourceURL,
+            inferenceBackend: inferenceBackend
+        )
     }
 
-    init(resourceURL: URL) throws {
+    init(
+        resourceURL: URL,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend
+    ) throws {
         self.resourceURL = resourceURL
+        self.inferenceBackend = inferenceBackend
         do {
             #if canImport(Darwin)
             if #available(iOS 16, macOS 13, *) {
-                self.zenzContext = try ZenzContext.createContext(path: resourceURL.path(percentEncoded: false))
+                self.zenzContext = try ZenzContext.createContext(
+                    path: resourceURL.path(percentEncoded: false),
+                    inferenceBackend: inferenceBackend
+                )
             } else {
                 // this is not percent-encoded
-                self.zenzContext = try ZenzContext.createContext(path: resourceURL.path)
+                self.zenzContext = try ZenzContext.createContext(
+                    path: resourceURL.path,
+                    inferenceBackend: inferenceBackend
+                )
             }
             #else
             // this is not percent-encoded
-            self.zenzContext = try ZenzContext.createContext(path: resourceURL.path)
+            self.zenzContext = try ZenzContext.createContext(
+                path: resourceURL.path,
+                inferenceBackend: inferenceBackend
+            )
             #endif
             debug("Loaded model \(resourceURL.lastPathComponent)")
         } catch {

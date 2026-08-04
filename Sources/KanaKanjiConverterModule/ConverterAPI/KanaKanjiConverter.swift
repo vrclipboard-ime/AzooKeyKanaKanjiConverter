@@ -13,6 +13,29 @@ import SwiftUtils
 
 /// かな漢字変換の管理を受け持つクラス
 public final class KanaKanjiConverter {
+    /// Initializes llama.cpp and loads dynamic CPU/GPU backends once per process.
+    ///
+    /// Pass the directory containing `ggml-cpu-*` and accelerator backend
+    /// libraries when llama.cpp was built with `GGML_BACKEND_DL`.
+    public static func initializeZenzaiBackend(searchPath: String? = nil) {
+        ZenzBackend.initializeIfNeeded(searchPath: searchPath)
+    }
+
+    /// Loads and validates a Zenzai model for the selected runtime backend.
+    ///
+    /// Call this when silently continuing without neural conversion would be
+    /// undesirable. Detailed diagnostics remain available in `zenzStatus`.
+    @discardableResult
+    public func prepareZenzaiModel(
+        weightURL: URL,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend = .gpu
+    ) -> Bool {
+        self.getModel(
+            modelURL: weightURL,
+            inferenceBackend: inferenceBackend
+        ) != nil
+    }
+
     /// 1つのConverterを複数の入力セッションで共有するための識別子。
     public struct ConversionSessionID: Hashable, Sendable {
         fileprivate let rawValue: String
@@ -258,13 +281,21 @@ public final class KanaKanjiConverter {
         return uniqueStableCandidates + additionalCandidates
     }
 
-    package func getModel(modelURL: URL) -> Zenz? {
-        if let model = self.zenz, model.resourceURL == modelURL {
+    package func getModel(
+        modelURL: URL,
+        inferenceBackend: ConvertRequestOptions.ZenzaiMode.InferenceBackend = .gpu
+    ) -> Zenz? {
+        if let model = self.zenz,
+           model.resourceURL == modelURL,
+           model.inferenceBackend == inferenceBackend {
             self.zenzStatus = "load \(modelURL.absoluteString)"
             return model
         } else {
             do {
-                self.zenz = try Zenz.shared(resourceURL: modelURL)
+                self.zenz = try Zenz.shared(
+                    resourceURL: modelURL,
+                    inferenceBackend: inferenceBackend
+                )
                 self.purgeZenzaiMemoizationCache()
                 self.sessions = self.sessions.mapValues { state in
                     let next = state
@@ -304,6 +335,7 @@ public final class KanaKanjiConverter {
             leftSideContext: leftSideContext,
             inputStyle: inputStyle,
             weightURL: options.zenzaiMode.weightURL,
+            inferenceBackend: options.zenzaiMode.inferenceBackend,
             versionDependentConfig: options.zenzaiMode.versionDependentMode
         )
         if let cachedPrediction = self.cachedPredictiveInputText(
@@ -313,7 +345,10 @@ public final class KanaKanjiConverter {
         ) {
             return cachedPrediction
         }
-        guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+        guard let zenz = self.getModel(
+            modelURL: options.zenzaiMode.weightURL,
+            inferenceBackend: options.zenzaiMode.inferenceBackend
+        ) else {
             self.invalidatePredictiveInputCache()
             print("zenz-v3 model unavailable")
             return ("", 0)
@@ -362,7 +397,10 @@ public final class KanaKanjiConverter {
                 debug("zenz mode is disabled")
                 return []
             }
-            guard let zenz = self.getModel(modelURL: options.zenzaiMode.weightURL) else {
+            guard let zenz = self.getModel(
+                modelURL: options.zenzaiMode.weightURL,
+                inferenceBackend: options.zenzaiMode.inferenceBackend
+            ) else {
                 debug("zenz model unavailable")
                 return []
             }
@@ -1096,7 +1134,11 @@ public final class KanaKanjiConverter {
         }
 
         // FIXME: enable cache based zenzai
-        if zenzaiMode.enabled, let model = self.getModel(modelURL: zenzaiMode.weightURL) {
+        if zenzaiMode.enabled,
+           let model = self.getModel(
+               modelURL: zenzaiMode.weightURL,
+               inferenceBackend: zenzaiMode.inferenceBackend
+           ) {
             let (result, nodes, cache) = self.converter.all_zenzai(
                 inputData,
                 zenz: model,

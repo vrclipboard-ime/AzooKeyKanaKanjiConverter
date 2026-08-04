@@ -5,6 +5,10 @@ module llama [system] {
     header "ggml-backend.h"
 
     link "llama"
+    // Swift calls ggml backend discovery/device APIs directly. Shared
+    // llama.cpp builds do not re-export those import-library symbols.
+    link "ggml"
+    link "ggml-base"
 
     export *
 }
